@@ -261,6 +261,11 @@ export class AgentSession {
 	// Base system prompt (without extension appends) - used to apply fresh appends each turn
 	private _baseSystemPrompt = "";
 
+	// Track whether context/skills were injected into the system prompt
+	// Used by UI to conditionally show "Loaded context/skills"
+	private _contextInjected = true;
+	private _skillsInjected = true;
+
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
@@ -611,7 +616,7 @@ export class AgentSession {
 		const loadedSkills = this._resourceLoader.getSkills().skills;
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
-		return buildSystemPrompt({
+		const result = buildSystemPrompt({
 			cwd: this._cwd,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
@@ -619,6 +624,12 @@ export class AgentSession {
 			appendSystemPrompt,
 			selectedTools: validToolNames,
 		});
+
+		// Track injection state for UI display
+		this._contextInjected = result.contextInjected;
+		this._skillsInjected = result.skillsInjected;
+
+		return result.prompt;
 	}
 
 	// =========================================================================
@@ -1030,6 +1041,16 @@ export class AgentSession {
 	/** Get pending follow-up messages (read-only) */
 	getFollowUpMessages(): readonly string[] {
 		return this._followUpMessages;
+	}
+
+	/** Whether context files were injected into the system prompt */
+	get contextInjected(): boolean {
+		return this._contextInjected;
+	}
+
+	/** Whether skills were injected into the system prompt */
+	get skillsInjected(): boolean {
+		return this._skillsInjected;
 	}
 
 	get resourceLoader(): ResourceLoader {

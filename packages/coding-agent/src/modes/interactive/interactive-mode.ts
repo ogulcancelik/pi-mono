@@ -870,23 +870,31 @@ export class InteractiveMode {
 
 		const sectionHeader = (name: string, color: ThemeColor = "mdHeading") => theme.fg(color, `[${name}]`);
 
-		const contextFiles = this.session.resourceLoader.getAgentsFiles().agentsFiles;
-		if (contextFiles.length > 0) {
-			const contextList = contextFiles.map((f) => theme.fg("dim", `  ${this.formatDisplayPath(f.path)}`)).join("\n");
-			this.chatContainer.addChild(new Text(`${sectionHeader("Context")}\n${contextList}`, 0, 0));
-			this.chatContainer.addChild(new Spacer(1));
+		// Only show context files if they were actually injected into the system prompt
+		if (this.session.contextInjected) {
+			const contextFiles = this.session.resourceLoader.getAgentsFiles().agentsFiles;
+			if (contextFiles.length > 0) {
+				const contextList = contextFiles
+					.map((f) => theme.fg("dim", `  ${this.formatDisplayPath(f.path)}`))
+					.join("\n");
+				this.chatContainer.addChild(new Text(`${sectionHeader("Context")}\n${contextList}`, 0, 0));
+				this.chatContainer.addChild(new Spacer(1));
+			}
 		}
 
-		const skills = this.session.resourceLoader.getSkills().skills;
-		if (skills.length > 0) {
-			const skillPaths = skills.map((s) => s.filePath);
-			const groups = this.buildScopeGroups(skillPaths, metadata);
-			const skillList = this.formatScopeGroups(groups, {
-				formatPath: (p) => this.formatDisplayPath(p),
-				formatPackagePath: (p, source) => this.getShortPath(p, source),
-			});
-			this.chatContainer.addChild(new Text(`${sectionHeader("Skills")}\n${skillList}`, 0, 0));
-			this.chatContainer.addChild(new Spacer(1));
+		// Only show skills if they were actually injected into the system prompt
+		if (this.session.skillsInjected) {
+			const skills = this.session.resourceLoader.getSkills().skills;
+			if (skills.length > 0) {
+				const skillPaths = skills.map((s) => s.filePath);
+				const groups = this.buildScopeGroups(skillPaths, metadata);
+				const skillList = this.formatScopeGroups(groups, {
+					formatPath: (p) => this.formatDisplayPath(p),
+					formatPackagePath: (p, source) => this.getShortPath(p, source),
+				});
+				this.chatContainer.addChild(new Text(`${sectionHeader("Skills")}\n${skillList}`, 0, 0));
+				this.chatContainer.addChild(new Spacer(1));
+			}
 		}
 
 		const skillDiagnostics = this.session.resourceLoader.getSkills().diagnostics;
