@@ -204,10 +204,59 @@ function generatePlaceholderLines(imageId: number, columns: number, rows: number
 	return lines;
 }
 
+// =============================================================================
+// tmux Image Upload Registry
+// =============================================================================
+
+/**
+ * Fast content fingerprint: length + first 64 chars + last 64 chars.
+ * Practically unique for different images while avoiding hashing megabytes.
+ */
+function imageFingerprint(base64Data: string): string {
+	const len = base64Data.length;
+	const head = base64Data.slice(0, 64);
+	const tail = len > 64 ? base64Data.slice(-64) : "";
+	return `${len}:${head}:${tail}`;
+}
+
+/**
+ * Registry of images uploaded to the terminal in the current process.
+ * Prevents re-uploading the same image data on re-renders and session restores.
+ */
+const tmuxUploadRegistry = new Map<string, { imageId: number }>();
+
+/**
+ * Check if an image has already been uploaded to the terminal.
+ */
+export function isImageUploaded(base64Data: string): boolean {
+	return tmuxUploadRegistry.has(imageFingerprint(base64Data));
+}
+
+/**
+ * Get the Kitty image ID for previously uploaded data, if available.
+ */
+export function getUploadedImageId(base64Data: string): number | undefined {
+	return tmuxUploadRegistry.get(imageFingerprint(base64Data))?.imageId;
+}
+
+/**
+ * Clear the upload registry (e.g., on terminal change).
+ */
+export function clearImageUploadRegistry(): void {
+	tmuxUploadRegistry.clear();
+}
+
+// =============================================================================
+// Kitty Unicode Placeholder Rendering (tmux)
+// =============================================================================
+
 /**
  * Render an image using Kitty Unicode placeholder mode for tmux.
  * Transmits image data via passthrough, creates virtual placement,
  * and returns placeholder text lines that tmux handles as normal text.
+ *
+ * Uses the upload registry to skip re-transmitting already-uploaded images.
+ * When `uploadSequence` is undefined, the image data is already in the terminal.
  */
 export function renderKittyUnicodePlaceholder(
 	base64Data: string,
@@ -216,22 +265,51 @@ export function renderKittyUnicodePlaceholder(
 		rows: number;
 		imageId: number;
 	},
-): { transmitSequence: string; placeholderLines: string[]; imageId: number } {
+): { uploadSequence: string | undefined; placementSequence: string; placeholderLines: string[]; imageId: number } {
 	const { columns, rows, imageId } = options;
 
-	// Step 1: Transmit image data (no display) via passthrough
-	const transmitSeq = encodeKittyTransmit(base64Data, imageId);
+	// Check registry — skip upload if already transmitted
+	const fingerprint = imageFingerprint(base64Data);
+	const existing = tmuxUploadRegistry.get(fingerprint);
+	let uploadSequence: string | undefined;
 
-	// Step 2: Create virtual placement via passthrough
-	const placementSeq = wrapTmuxPassthrough(`\x1b_Ga=p,U=1,i=${imageId},c=${columns},r=${rows},q=2\x1b\\`);
+	if (existing) {
+		// Image already uploaded — reuse the existing ID for placement
+		// (caller should use existing.imageId, but we respect the provided imageId for placement)
+	} else {
+		// First time: generate upload sequence and register
+		uploadSequence = encodeKittyTransmit(base64Data, imageId);
+		tmuxUploadRegistry.set(fingerprint, { imageId });
+	}
 
-	// Step 3: Generate placeholder text lines
-	const placeholderLines = generatePlaceholderLines(imageId, columns, rows);
+	// Placement is always needed (cheap — just a small control sequence)
+	const effectiveId = existing?.imageId ?? imageId;
+	const placementSequence = wrapTmuxPassthrough(`\x1b_Ga=p,U=1,i=${effectiveId},c=${columns},r=${rows},q=2\x1b\\`);
+
+	// Generate placeholder text lines
+	const placeholderLines = generatePlaceholderLines(effectiveId, columns, rows);
 
 	return {
-		transmitSequence: transmitSeq + placementSeq,
+		uploadSequence,
+		placementSequence,
 		placeholderLines,
-		imageId,
+		imageId: effectiveId,
+	};
+}
+
+/**
+ * @deprecated Use the `uploadSequence`/`placementSequence` fields from `renderKittyUnicodePlaceholder` instead.
+ * Legacy compat: returns combined transmitSequence for callers that expect the old API.
+ */
+export function renderKittyUnicodePlaceholderLegacy(
+	base64Data: string,
+	options: { columns: number; rows: number; imageId: number },
+): { transmitSequence: string; placeholderLines: string[]; imageId: number } {
+	const result = renderKittyUnicodePlaceholder(base64Data, options);
+	return {
+		transmitSequence: (result.uploadSequence ?? "") + result.placementSequence,
+		placeholderLines: result.placeholderLines,
+		imageId: result.imageId,
 	};
 }
 
@@ -475,7 +553,7 @@ export function getImageDimensions(base64Data: string, mimeType: string): ImageD
 }
 
 export interface RenderImageResult {
-	/** Escape sequence for direct image display (non-placeholder mode). */
+	/** Escape sequence for image display. In direct mode: full image. In tmux mode: placement command only. */
 	sequence: string;
 	/** Number of rows the image occupies. */
 	rows: number;
@@ -483,6 +561,9 @@ export interface RenderImageResult {
 	imageId?: number;
 	/** Unicode placeholder text lines for tmux mode. When present, use these as visible content. */
 	placeholderLines?: string[];
+	/** tmux only: image data upload sequence. Write to terminal before rendering placeholders.
+	 *  Undefined when image is already uploaded (registry hit). */
+	uploadSequence?: string;
 }
 
 export function renderImage(
@@ -512,10 +593,11 @@ export function renderImage(
 				imageId,
 			});
 			return {
-				sequence: result.transmitSequence,
+				sequence: result.placementSequence,
 				rows,
 				imageId: result.imageId,
 				placeholderLines: result.placeholderLines,
+				uploadSequence: result.uploadSequence,
 			};
 		}
 

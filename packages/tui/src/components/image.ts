@@ -78,8 +78,14 @@ export class Image implements Component {
 				}
 
 				if (result.placeholderLines) {
-					// Unicode placeholder mode (tmux): placeholder chars are normal text.
-					// Prepend the transmit sequence (invisible escape codes) to the first line.
+					// Unicode placeholder mode (tmux):
+					// Upload image data directly to terminal (bypasses render cache).
+					// Registry in terminal-image.ts prevents duplicate uploads.
+					if (result.uploadSequence) {
+						process.stdout.write(result.uploadSequence);
+					}
+					// Prepend only the placement command (tiny) to first line.
+					// Placeholder chars are normal text that tmux handles natively.
 					lines = [...result.placeholderLines];
 					lines[0] = result.sequence + lines[0];
 				} else {

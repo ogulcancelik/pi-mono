@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { PLACEHOLDER_DIACRITICS } from "../src/placeholder-diacritics.js";
 import {
 	allocatePlaceholderImageId,
+	clearImageUploadRegistry,
 	deleteAllKittyImages,
 	deleteKittyImage,
 	isImageLine,
@@ -64,38 +65,56 @@ describe("allocatePlaceholderImageId", () => {
 });
 
 describe("renderKittyUnicodePlaceholder", () => {
-	it("should return transmit sequence, placeholder lines, and image ID", () => {
+	beforeEach(() => {
+		clearImageUploadRegistry();
+	});
+
+	it("should return upload sequence, placement sequence, placeholder lines, and image ID", () => {
 		const result = renderKittyUnicodePlaceholder("AAAA", {
 			columns: 3,
 			rows: 2,
 			imageId: 42,
 		});
 
-		assert.ok(result.transmitSequence.length > 0);
+		assert.ok(result.uploadSequence, "First render should have upload sequence");
+		assert.ok(result.uploadSequence!.length > 0);
+		assert.ok(result.placementSequence.length > 0);
 		assert.strictEqual(result.placeholderLines.length, 2);
 		assert.strictEqual(result.imageId, 42);
 	});
 
-	it("should wrap transmit sequence in tmux passthrough", () => {
+	it("should skip upload on second call with same data (registry hit)", () => {
+		const opts = { columns: 2, rows: 1, imageId: 1 };
+		const first = renderKittyUnicodePlaceholder("AAAA", opts);
+		assert.ok(first.uploadSequence, "First call should have upload sequence");
+
+		const second = renderKittyUnicodePlaceholder("AAAA", { ...opts, imageId: 2 });
+		assert.strictEqual(second.uploadSequence, undefined, "Second call should skip upload");
+		// Should reuse the original image ID from registry
+		assert.strictEqual(second.imageId, first.imageId);
+	});
+
+	it("should wrap upload sequence in tmux passthrough", () => {
 		const result = renderKittyUnicodePlaceholder("AAAA", {
 			columns: 2,
 			rows: 1,
 			imageId: 1,
 		});
 
-		assert.ok(result.transmitSequence.includes("\x1bPtmux;"));
+		assert.ok(result.uploadSequence!.includes("\x1bPtmux;"));
 	});
 
-	it("should include virtual placement in transmit sequence", () => {
+	it("should return placement as separate sequence", () => {
 		const result = renderKittyUnicodePlaceholder("AAAA", {
 			columns: 5,
 			rows: 3,
 			imageId: 99,
 		});
 
-		// The virtual placement should contain U=1, the image id, columns and rows
-		// It's passthrough-wrapped so ESCs are doubled
-		assert.ok(result.transmitSequence.includes("a=p,U=1,i=99,c=5,r=3"));
+		// Placement should contain U=1, the image id, columns and rows
+		assert.ok(result.placementSequence.includes("a=p,U=1,i=99,c=5,r=3"));
+		// Placement should be passthrough-wrapped
+		assert.ok(result.placementSequence.includes("\x1bPtmux;"));
 	});
 
 	it("should encode image ID in foreground color", () => {
@@ -169,9 +188,9 @@ describe("renderKittyUnicodePlaceholder", () => {
 			imageId: 1,
 		});
 
-		// The transmit sequence should use a=t (store, no display)
-		assert.ok(result.transmitSequence.includes("a=t"));
-		assert.ok(!result.transmitSequence.includes("a=T"));
+		// The upload sequence should use a=t (store, no display)
+		assert.ok(result.uploadSequence!.includes("a=t"));
+		assert.ok(!result.uploadSequence!.includes("a=T"));
 	});
 });
 
@@ -244,6 +263,7 @@ describe("renderImage tmux mode", () => {
 		originalTmux = process.env.TMUX;
 		originalGhostty = process.env.GHOSTTY_RESOURCES_DIR;
 		resetCapabilitiesCache();
+		clearImageUploadRegistry();
 	});
 
 	afterEach(() => {
