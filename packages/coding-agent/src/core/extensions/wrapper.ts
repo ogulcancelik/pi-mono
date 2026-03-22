@@ -15,7 +15,7 @@ import type { RegisteredTool } from "./types.js";
  * Uses the runner's createContext() for consistent context across tools and event handlers.
  */
 export function wrapRegisteredTool(registeredTool: RegisteredTool, runner: ExtensionRunner): AgentTool {
-	return wrapToolDefinition(registeredTool.definition, () => runner.createContext());
+	return wrapToolDefinition(registeredTool.definition, () => runner.createCommandContext());
 }
 
 /**

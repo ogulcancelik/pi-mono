@@ -1,10 +1,10 @@
 import type { AgentTool } from "@mariozechner/pi-agent-core";
-import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
+import type { ExtensionCommandContext, ToolDefinition } from "../extensions/types.js";
 
 /** Wrap a ToolDefinition into an AgentTool for the core runtime. */
 export function wrapToolDefinition<TDetails = unknown>(
 	definition: ToolDefinition<any, TDetails>,
-	ctxFactory?: () => ExtensionContext,
+	ctxFactory?: () => ExtensionCommandContext,
 ): AgentTool<any, TDetails> {
 	return {
 		name: definition.name,
@@ -12,14 +12,14 @@ export function wrapToolDefinition<TDetails = unknown>(
 		description: definition.description,
 		parameters: definition.parameters,
 		execute: (toolCallId, params, signal, onUpdate) =>
-			definition.execute(toolCallId, params, signal, onUpdate, ctxFactory?.() as ExtensionContext),
+			definition.execute(toolCallId, params, signal, onUpdate, ctxFactory?.() as ExtensionCommandContext),
 	};
 }
 
 /** Wrap multiple ToolDefinitions into AgentTools for the core runtime. */
 export function wrapToolDefinitions(
 	definitions: ToolDefinition<any, any>[],
-	ctxFactory?: () => ExtensionContext,
+	ctxFactory?: () => ExtensionCommandContext,
 ): AgentTool<any>[] {
 	return definitions.map((definition) => wrapToolDefinition(definition, ctxFactory));
 }
