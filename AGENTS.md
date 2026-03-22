@@ -1,3 +1,59 @@
+# Can's Fork of pi-mono
+
+This is **not upstream pi**. This is Can's local fork on the `can/local` branch.
+
+- **Upstream**: `origin` -> `github.com/badlogic/pi-mono`
+- **Fork**: `fork` -> `github.com/ogulcancelik/pi-mono`
+
+## Branch layout
+
+- **`can/local`** — daily driver branch. Upstream main + local changes listed below. This is what `pi` links to.
+- **`fix/*`, `feat/*`** — clean PR branches off `origin/main` for upstream contributions. One change per branch, no local stuff mixed in.
+
+## Updating from upstream
+
+```bash
+git fetch origin
+git rebase origin/main
+# resolve conflicts, keep our local changes on top
+npm run check
+```
+
+If upstream merges one of our PR branches, drop the corresponding local commit during rebase (it'll already be in upstream).
+
+## Building and linking local pi
+
+After rebasing or changing the local branch, rebuild and link so the `pi` command uses the local build:
+
+```bash
+npm run build
+cd packages/coding-agent && npm link
+```
+
+`npm link` creates a global symlink so `pi` points to `packages/coding-agent/dist/cli.js` in this repo. To verify it's linked (symlink, not a real directory):
+
+```bash
+ls -la $(readlink -f $(which pi) | sed 's|/dist/cli.js||')
+# should show a symlink pointing to this repo
+```
+
+To go back to the upstream released version:
+
+```bash
+npm i -g @mariozechner/pi-coding-agent
+```
+
+## Local changes (not in upstream)
+
+Keep this list up to date when adding/removing local patches.
+
+- **Extension tools get `ExtensionCommandContext`** — tool `execute` handlers receive command context (with `newSession`, `fork`, etc.) instead of base `ExtensionContext`. Pending upstream approval. PR branch: `fix/extension-tool-command-context`.
+- **Tmux inline images via kitty unicode placeholders** — renders images inline in tmux using kitty's unicode placeholder protocol.
+- **Image upload registry** — deduplicates tmux image uploads.
+- **413 request too large recovery** — catches 413 responses and recovers gracefully.
+
+---
+
 # Development Rules
 
 ## First Message
