@@ -18,7 +18,12 @@ import type { SessionInfo, SessionListProgress } from "../../../core/session-man
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyHint, keyText } from "./keybinding-hints.js";
-import { filterAndSortSessions, hasSessionName, type NameFilter, type SortMode } from "./session-selector-search.js";
+import {
+	filterAndSortSessionsAsync,
+	hasSessionName,
+	type NameFilter,
+	type SortMode,
+} from "./session-selector-search.js";
 
 type SessionScope = "current" | "all";
 
@@ -53,6 +58,7 @@ class SessionSelectorHeader implements Component {
 	private nameFilter: NameFilter;
 	private requestRender: () => void;
 	private loading = false;
+	private searching = false;
 	private loadProgress: { loaded: number; total: number } | null = null;
 	private showPath = false;
 	private confirmingDeletePath: string | null = null;
@@ -83,6 +89,10 @@ class SessionSelectorHeader implements Component {
 		this.loading = loading;
 		// Progress is scoped to the current load; clear whenever the loading state is set
 		this.loadProgress = null;
+	}
+
+	setSearching(searching: boolean): void {
+		this.searching = searching;
 	}
 
 	setProgress(loaded: number, total: number): void {
@@ -135,6 +145,8 @@ class SessionSelectorHeader implements Component {
 		if (this.loading) {
 			const progressText = this.loadProgress ? `${this.loadProgress.loaded}/${this.loadProgress.total}` : "...";
 			scopeText = `${theme.fg("muted", "○ Current Folder | ")}${theme.fg("accent", `Loading ${progressText}`)}`;
+		} else if (this.searching) {
+			scopeText = `${theme.fg("muted", "○ Current Folder | ")}${theme.fg("accent", "Searching...")}`;
 		} else if (this.scope === "current") {
 			scopeText = `${theme.fg("accent", "◉ Current Folder")}${theme.fg("muted", " | ○ All")}`;
 		} else {
@@ -285,7 +297,13 @@ class SessionList implements Component, Focusable {
 	public onDeleteSession?: (sessionPath: string) => Promise<void>;
 	public onRenameSession?: (sessionPath: string) => void;
 	public onError?: (message: string) => void;
+	public onSearchingChange?: (searching: boolean) => void;
 	private maxVisible: number = 10; // Max sessions visible (one line each)
+
+	// Async search state
+	private isSearching = false;
+	private searchGeneration = 0;
+	private requestRender: (() => void) | null = null;
 
 	// Focusable implementation - propagate to searchInput for IME cursor positioning
 	private _focused = false;
@@ -313,7 +331,8 @@ class SessionList implements Component, Focusable {
 		this.nameFilter = nameFilter;
 		this.keybindings = keybindings;
 		this.currentSessionFilePath = currentSessionFilePath;
-		this.filterSessions("");
+		// Start with empty list, async filter will populate
+		void this.filterSessionsAsync("");
 
 		// Handle Enter in search input - select current item
 		this.searchInput.onSubmit = () => {
@@ -328,40 +347,96 @@ class SessionList implements Component, Focusable {
 
 	setSortMode(sortMode: SortMode): void {
 		this.sortMode = sortMode;
-		this.filterSessions(this.searchInput.getValue());
+		void this.filterSessionsAsync(this.searchInput.getValue());
 	}
 
 	setNameFilter(nameFilter: NameFilter): void {
 		this.nameFilter = nameFilter;
-		this.filterSessions(this.searchInput.getValue());
+		void this.filterSessionsAsync(this.searchInput.getValue());
 	}
 
-	setSessions(sessions: SessionInfo[], showCwd: boolean): void {
+	setSessions(sessions: SessionInfo[], showCwd: boolean, requestRender?: () => void): void {
 		this.allSessions = sessions;
 		this.showCwd = showCwd;
-		this.filterSessions(this.searchInput.getValue());
+		if (requestRender) {
+			this.requestRender = requestRender;
+		}
+		void this.filterSessionsAsync(this.searchInput.getValue());
 	}
 
-	private filterSessions(query: string): void {
+	/** Set render callback for async search updates */
+	setRequestRender(callback: () => void): void {
+		this.requestRender = callback;
+	}
+
+	/** Get current search state for UI indication */
+	getIsSearching(): boolean {
+		return this.isSearching;
+	}
+
+	private async filterSessionsAsync(query: string): Promise<void> {
 		const trimmed = query.trim();
 		const nameFiltered =
 			this.nameFilter === "all" ? this.allSessions : this.allSessions.filter((session) => hasSessionName(session));
 
+		// For threaded mode without query, use sync path
 		if (this.sortMode === "threaded" && !trimmed) {
-			// Threaded mode without search: show tree structure
 			const roots = buildSessionTree(nameFiltered);
 			this.filteredSessions = flattenSessionTree(roots);
-		} else {
-			// Other modes or with search: flat list
-			const filtered = filterAndSortSessions(nameFiltered, query, this.sortMode, "all");
+			this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredSessions.length - 1));
+			this.isSearching = false;
+			this.onSearchingChange?.(false);
+			this.requestRender?.();
+			return;
+		}
+
+		// No query: sort by recent
+		if (!trimmed) {
+			const sorted = [...nameFiltered].sort((a, b) => b.modified.getTime() - a.modified.getTime());
+			this.filteredSessions = sorted.map((session) => ({
+				session,
+				depth: 0,
+				isLast: true,
+				ancestorContinues: [],
+			}));
+			this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredSessions.length - 1));
+			this.isSearching = false;
+			this.onSearchingChange?.(false);
+			this.requestRender?.();
+			return;
+		}
+
+		// Has search query: load full text on demand with bounded concurrency
+		const generation = ++this.searchGeneration;
+		this.isSearching = true;
+		this.onSearchingChange?.(true);
+		this.requestRender?.();
+
+		try {
+			const filtered = await filterAndSortSessionsAsync(nameFiltered, query, this.sortMode, "all");
+
+			// Check if this search is still current
+			if (generation !== this.searchGeneration) return;
+
 			this.filteredSessions = filtered.map((session) => ({
 				session,
 				depth: 0,
 				isLast: true,
 				ancestorContinues: [],
 			}));
+			this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredSessions.length - 1));
+		} catch {
+			// On error, show empty results
+			if (generation === this.searchGeneration) {
+				this.filteredSessions = [];
+			}
+		} finally {
+			if (generation === this.searchGeneration) {
+				this.isSearching = false;
+				this.onSearchingChange?.(false);
+				this.requestRender?.();
+			}
 		}
-		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredSessions.length - 1));
 	}
 
 	private setConfirmingDeletePath(path: string | null): void {
@@ -565,7 +640,7 @@ class SessionList implements Component, Focusable {
 		if (kb.matches(keyData, "app.session.deleteNoninvasive")) {
 			if (this.searchInput.getValue().length > 0) {
 				this.searchInput.handleInput(keyData);
-				this.filterSessions(this.searchInput.getValue());
+				void this.filterSessionsAsync(this.searchInput.getValue());
 				return;
 			}
 
@@ -605,7 +680,7 @@ class SessionList implements Component, Focusable {
 		// Pass everything else to search input
 		else {
 			this.searchInput.handleInput(keyData);
-			this.filterSessions(this.searchInput.getValue());
+			void this.filterSessionsAsync(this.searchInput.getValue());
 		}
 	}
 }
@@ -802,6 +877,10 @@ export class SessionSelectorComponent extends Container implements Focusable {
 			this.header.setStatusMessage({ type: "error", message: msg }, 3000);
 			this.requestRender();
 		};
+		this.sessionList.onSearchingChange = (searching) => {
+			this.header.setSearching(searching);
+			this.requestRender();
+		};
 
 		// Handle session deletion
 		this.sessionList.onDeleteSession = async (sessionPath: string) => {
@@ -817,7 +896,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 				const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
 				const showCwd = this.scope === "all";
-				this.sessionList.setSessions(sessions, showCwd);
+				this.sessionList.setSessions(sessions, showCwd, this.requestRender);
 
 				const msg = result.method === "trash" ? "Session moved to trash" : "Session deleted";
 				this.header.setStatusMessage({ type: "info", message: msg }, 2000);
@@ -933,7 +1012,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 			if (seq !== undefined && seq !== this.allLoadSeq) return;
 
 			this.header.setLoading(false);
-			this.sessionList.setSessions(sessions, showCwd);
+			this.sessionList.setSessions(sessions, showCwd, this.requestRender);
 			this.requestRender();
 
 			if (scope === "all" && sessions.length === 0 && (this.currentSessions?.length ?? 0) === 0) {
@@ -954,7 +1033,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 			this.header.setStatusMessage({ type: "error", message: `Failed to load sessions: ${message}` }, 4000);
 
 			if (reason === "initial") {
-				this.sessionList.setSessions([], showCwd);
+				this.sessionList.setSessions([], showCwd, this.requestRender);
 			}
 			this.requestRender();
 		}
@@ -986,7 +1065,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 			if (this.allSessions !== null) {
 				this.header.setLoading(false);
-				this.sessionList.setSessions(this.allSessions, true);
+				this.sessionList.setSessions(this.allSessions, true, this.requestRender);
 				this.requestRender();
 				return;
 			}
@@ -1000,7 +1079,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		this.scope = "current";
 		this.header.setScope(this.scope);
 		this.header.setLoading(this.currentLoading);
-		this.sessionList.setSessions(this.currentSessions ?? [], false);
+		this.sessionList.setSessions(this.currentSessions ?? [], false, this.requestRender);
 		this.requestRender();
 	}
 

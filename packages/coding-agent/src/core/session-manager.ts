@@ -13,7 +13,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "fs";
-import { readdir, readFile, stat } from "fs/promises";
+import { open, readdir, readFile, stat } from "fs/promises";
 import { join, resolve } from "path";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import {
@@ -178,6 +178,46 @@ export interface SessionInfo {
 	messageCount: number;
 	firstMessage: string;
 	allMessagesText: string;
+}
+
+/**
+ * Light session info for fast initial loading.
+ * Some fields may be undefined until hydrated.
+ */
+export interface SessionInfoLight {
+	path: string;
+	id: string;
+	cwd: string;
+	name?: string;
+	parentSessionPath?: string;
+	created: Date;
+	/** File mtime (not semantic last activity) - fast but may differ from SessionInfo.modified */
+	modified: Date;
+	/** Partial count from initial scan; undefined if not yet known */
+	messageCount?: number;
+	/** Preview text; undefined if not yet scanned */
+	firstMessage?: string;
+	/** Full text for search; undefined until loaded on demand */
+	allMessagesText?: string;
+	/** True if this is a partial load (has more data available) */
+	_isPartial?: boolean;
+}
+
+/** Process items with bounded concurrency */
+async function withConcurrency<T, R>(items: T[], fn: (item: T) => Promise<R>, concurrency: number): Promise<R[]> {
+	const results: R[] = new Array(items.length);
+	let index = 0;
+
+	async function worker(): Promise<void> {
+		while (index < items.length) {
+			const i = index++;
+			results[i] = await fn(items[i]!);
+		}
+	}
+
+	const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+	await Promise.all(workers);
+	return results;
 }
 
 export type ReadonlySessionManager = Pick<
@@ -611,7 +651,124 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	}
 }
 
+/**
+ * Build light session info by reading only the header and first chunk of the file.
+ * Uses file mtime for modified date (fast) instead of scanning for last activity.
+ * Returns partial data suitable for initial list display.
+ */
+async function buildSessionInfoLight(
+	filePath: string,
+	scanBytes = 16384, // Read first 16KB - usually enough for header + first user message
+): Promise<SessionInfoLight | null> {
+	try {
+		const stats = await stat(filePath);
+
+		// Read first chunk using file handle for efficiency
+		const handle = await open(filePath, "r");
+		const buffer = Buffer.alloc(scanBytes);
+		const { bytesRead } = await handle.read(buffer, 0, scanBytes, 0);
+		await handle.close();
+
+		const chunk = buffer.toString("utf8", 0, bytesRead);
+		const lines = chunk.split("\n");
+
+		// Parse header from first line
+		if (lines.length === 0) return null;
+		let header: SessionHeader | undefined;
+		try {
+			const firstEntry = JSON.parse(lines[0]!) as FileEntry;
+			if (firstEntry.type === "session") {
+				header = firstEntry as SessionHeader;
+			}
+		} catch {
+			return null;
+		}
+		if (!header) return null;
+
+		// Scan entries in the chunk we have
+		let messageCount = 0;
+		let firstMessage: string | undefined;
+		let name: string | undefined;
+		const parentSessionPath = header.parentSession;
+
+		// Process complete lines only (skip partial last line if chunk was truncated)
+		const completeLines = bytesRead < scanBytes ? lines : lines.slice(0, -1);
+
+		for (let i = 1; i < completeLines.length; i++) {
+			const line = completeLines[i];
+			if (!line?.trim()) continue;
+
+			try {
+				const entry = JSON.parse(line) as FileEntry;
+
+				if (entry.type === "session_info") {
+					const infoEntry = entry as SessionInfoEntry;
+					if (infoEntry.name?.trim()) {
+						name = infoEntry.name.trim();
+					}
+				}
+
+				if (entry.type === "message") {
+					messageCount++;
+					const msgEntry = entry as SessionMessageEntry;
+					const message = msgEntry.message;
+					if (
+						!firstMessage &&
+						isMessageWithContent(message) &&
+						(message.role === "user" || message.role === "assistant")
+					) {
+						const text = extractTextContent(message);
+						if (text) {
+							firstMessage = text;
+						}
+					}
+				}
+			} catch {
+				// Skip malformed lines
+			}
+		}
+
+		const cwd = typeof header.cwd === "string" ? header.cwd : "";
+
+		return {
+			path: filePath,
+			id: header.id,
+			cwd,
+			name,
+			parentSessionPath,
+			created: new Date(header.timestamp),
+			modified: stats.mtime,
+			messageCount,
+			firstMessage,
+			_isPartial: bytesRead >= scanBytes, // May have more data
+		};
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Hydrate a light session info by loading the full file.
+ * This loads allMessagesText and ensures messageCount/firstMessage are complete.
+ */
+async function _hydrateSessionInfo(light: SessionInfoLight): Promise<SessionInfo> {
+	const full = await buildSessionInfo(light.path);
+	if (!full) {
+		// Return light cast as SessionInfo with defaults
+		return {
+			...light,
+			messageCount: light.messageCount ?? 0,
+			firstMessage: light.firstMessage ?? "(no messages)",
+			allMessagesText: "",
+		};
+	}
+	return full;
+}
+
 export type SessionListProgress = (loaded: number, total: number) => void;
+
+/** Default concurrency for light session scanning */
+const DEFAULT_LIGHT_CONCURRENCY = 16;
 
 async function listSessionsFromDir(
 	dir: string,
@@ -630,17 +787,26 @@ async function listSessionsFromDir(
 		const total = progressTotal ?? files.length;
 
 		let loaded = 0;
-		const results = await Promise.all(
-			files.map(async (file) => {
-				const info = await buildSessionInfo(file);
+		const results = await withConcurrency(
+			files,
+			async (file) => {
+				const info = await buildSessionInfoLight(file);
 				loaded++;
 				onProgress?.(progressOffset + loaded, total);
 				return info;
-			}),
+			},
+			DEFAULT_LIGHT_CONCURRENCY,
 		);
+
 		for (const info of results) {
 			if (info) {
-				sessions.push(info);
+				// Cast to SessionInfo - allMessagesText will be loaded on demand for search
+				sessions.push({
+					...info,
+					messageCount: info.messageCount ?? 0,
+					firstMessage: info.firstMessage ?? "(loading...)",
+					allMessagesText: "",
+				} as SessionInfo);
 			}
 		}
 	} catch {
@@ -1395,18 +1561,25 @@ export class SessionManager {
 			const sessions: SessionInfo[] = [];
 			const allFiles = dirFiles.flat();
 
-			const results = await Promise.all(
-				allFiles.map(async (file) => {
-					const info = await buildSessionInfo(file);
+			const results = await withConcurrency(
+				allFiles,
+				async (file) => {
+					const info = await buildSessionInfoLight(file);
 					loaded++;
 					onProgress?.(loaded, totalFiles);
 					return info;
-				}),
+				},
+				DEFAULT_LIGHT_CONCURRENCY,
 			);
 
 			for (const info of results) {
 				if (info) {
-					sessions.push(info);
+					sessions.push({
+						...info,
+						messageCount: info.messageCount ?? 0,
+						firstMessage: info.firstMessage ?? "(loading...)",
+						allMessagesText: "",
+					} as SessionInfo);
 				}
 			}
 
@@ -1415,5 +1588,13 @@ export class SessionManager {
 		} catch {
 			return [];
 		}
+	}
+
+	/**
+	 * Load full session info including allMessagesText for search.
+	 * This is expensive and should only be called when needed (e.g., for search).
+	 */
+	static async loadFullSessionInfo(path: string): Promise<SessionInfo | null> {
+		return buildSessionInfo(path);
 	}
 }

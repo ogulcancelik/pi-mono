@@ -1,9 +1,52 @@
 import { fuzzyMatch } from "@mariozechner/pi-tui";
-import type { SessionInfo } from "../../../core/session-manager.js";
+import { type SessionInfo, SessionManager } from "../../../core/session-manager.js";
 
 export type SortMode = "threaded" | "recent" | "relevance";
 
 export type NameFilter = "all" | "named";
+
+/** Cache for loaded session text to avoid reloading during a picker session */
+const sessionTextCache = new Map<string, string>();
+
+/** Bounded concurrency for loading session text during search */
+async function withConcurrency<T, R>(items: T[], fn: (item: T) => Promise<R>, concurrency: number): Promise<R[]> {
+	const results: R[] = new Array(items.length);
+	let index = 0;
+
+	async function worker(): Promise<void> {
+		while (index < items.length) {
+			const i = index++;
+			results[i] = await fn(items[i]!);
+		}
+	}
+
+	const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+	await Promise.all(workers);
+	return results;
+}
+
+/** Load allMessagesText for a session, using cache */
+async function loadSessionSearchText(session: SessionInfo): Promise<string> {
+	const cached = sessionTextCache.get(session.path);
+	if (cached !== undefined) return cached;
+
+	// If allMessagesText is already populated, use it
+	if (session.allMessagesText) {
+		sessionTextCache.set(session.path, session.allMessagesText);
+		return session.allMessagesText;
+	}
+
+	// Load full session info
+	const full = await SessionManager.loadFullSessionInfo(session.path);
+	const text = full?.allMessagesText ?? "";
+	sessionTextCache.set(session.path, text);
+	return text;
+}
+
+/** Clear the session text cache */
+export function clearSessionTextCache(): void {
+	sessionTextCache.clear();
+}
 
 export interface ParsedSearchQuery {
 	mode: "tokens" | "regex";
@@ -185,6 +228,99 @@ export function filterAndSortSessions(
 		scored.push({ session: s, score: res.score });
 	}
 
+	scored.sort((a, b) => {
+		if (a.score !== b.score) return a.score - b.score;
+		return b.session.modified.getTime() - a.session.modified.getTime();
+	});
+
+	return scored.map((r) => r.session);
+}
+
+/**
+ * Match a session against search query with lazy loading of full text.
+ * Loads allMessagesText on demand if not already cached.
+ */
+async function matchSessionAsync(session: SessionInfo, parsed: ParsedSearchQuery): Promise<MatchResult> {
+	const searchText = await loadSessionSearchText(session);
+	const text = `${session.id} ${session.name ?? ""} ${searchText} ${session.cwd}`;
+
+	if (parsed.mode === "regex") {
+		if (!parsed.regex) {
+			return { matches: false, score: 0 };
+		}
+		const idx = text.search(parsed.regex);
+		if (idx < 0) return { matches: false, score: 0 };
+		return { matches: true, score: idx * 0.1 };
+	}
+
+	if (parsed.tokens.length === 0) {
+		return { matches: true, score: 0 };
+	}
+
+	let totalScore = 0;
+	let normalizedText: string | null = null;
+
+	for (const token of parsed.tokens) {
+		if (token.kind === "phrase") {
+			if (normalizedText === null) {
+				normalizedText = normalizeWhitespaceLower(text);
+			}
+			const phrase = normalizeWhitespaceLower(token.value);
+			if (!phrase) continue;
+			const idx = normalizedText.indexOf(phrase);
+			if (idx < 0) return { matches: false, score: 0 };
+			totalScore += idx * 0.1;
+			continue;
+		}
+
+		const m = fuzzyMatch(token.value, text);
+		if (!m.matches) return { matches: false, score: 0 };
+		totalScore += m.score;
+	}
+
+	return { matches: true, score: totalScore };
+}
+
+/** Concurrency for search loading */
+const SEARCH_CONCURRENCY = 4;
+
+/**
+ * Async version of filterAndSortSessions that loads full text on demand.
+ * Use this when searching sessions that may not have allMessagesText loaded.
+ */
+export async function filterAndSortSessionsAsync(
+	sessions: SessionInfo[],
+	query: string,
+	sortMode: SortMode,
+	nameFilter: NameFilter = "all",
+): Promise<SessionInfo[]> {
+	const nameFiltered =
+		nameFilter === "all" ? sessions : sessions.filter((session) => matchesNameFilter(session, nameFilter));
+	const trimmed = query.trim();
+	if (!trimmed) return nameFiltered;
+
+	const parsed = parseSearchQuery(query);
+	if (parsed.error) return [];
+
+	// Load and match with bounded concurrency
+	const results = await withConcurrency(
+		nameFiltered,
+		async (session) => {
+			const res = await matchSessionAsync(session, parsed);
+			return { session, res };
+		},
+		SEARCH_CONCURRENCY,
+	);
+
+	const matched = results.filter((r) => r.res.matches);
+
+	// Recent mode: filter only, keep incoming order.
+	if (sortMode === "recent") {
+		return matched.map((r) => r.session);
+	}
+
+	// Relevance mode: sort by score
+	const scored = matched.map((r) => ({ session: r.session, score: r.res.score }));
 	scored.sort((a, b) => {
 		if (a.score !== b.score) return a.score - b.score;
 		return b.session.modified.getTime() - a.session.modified.getTime();
